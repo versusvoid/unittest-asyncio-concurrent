@@ -100,7 +100,7 @@ async def maybe_await(f, *args, **kwargs):
 
 # TODO addCleanup/doCleanups
 
-class ParallelAsyncioTestCaseMixin(object):
+class ConcurrentAsyncioTestCaseMixin(object):
     # copy-paste from TestCase/IsolatedAsyncioTestCase cpython 3.8.1
     async def asyncSetUp(self):
         pass
@@ -195,12 +195,12 @@ class ParallelAsyncioTestCaseMixin(object):
                 await maybe_await(function, *args, **kwargs)
 
 
-class ParallelAsyncioTestSuite(unittest.BaseTestSuite):
+class ConcurrentAsyncioTestSuite(unittest.BaseTestSuite):
 
     TestModule = collections.namedtuple('TestModule', 'submodules, classes')
 
     def __init__(self):
-        self._tree = ParallelAsyncioTestSuite.TestModule({}, {})
+        self._tree = ConcurrentAsyncioTestSuite.TestModule({}, {})
 
     def add_to_tree(self, tests: Iterable[unittest.TestCase]):
         tests = list(tests)
@@ -210,7 +210,7 @@ class ParallelAsyncioTestSuite(unittest.BaseTestSuite):
         assert isinstance(tests[0], unittest.TestCase)
         assert all(t.__class__ is tests[0].__class__ for t in tests)
         # 0 - MixedTestCaseClass
-        # 1 - ParallelAsyncioTestCaseMixin
+        # 1 - ConcurrentAsyncioTestCaseMixin
         # 2 - original testCaseClass
         original_class = inspect.getmro(tests[0].__class__)[2]
 
@@ -218,7 +218,7 @@ class ParallelAsyncioTestSuite(unittest.BaseTestSuite):
         current = self._tree
         for i, component in enumerate(module_components):
             if component not in current.submodules:
-                new = ParallelAsyncioTestSuite.TestModule({}, collections.defaultdict(list))
+                new = ConcurrentAsyncioTestSuite.TestModule({}, collections.defaultdict(list))
                 current.submodules[component] = new
                 current = new
             else:
@@ -317,15 +317,15 @@ class ParallelAsyncioTestSuite(unittest.BaseTestSuite):
                 self._createClassOrModuleLevelException(result, e, 'tearDownClass', str(cls))
 
 
-class ParallelAsyncioTestLoader(unittest.TestLoader):
+class ConcurrentAsyncioTestLoader(unittest.TestLoader):
     # Simple wrapper which reuses single suite and mixes in async run() for test cases
 
     def __init__(self):
         super().__init__()
-        self._suite = ParallelAsyncioTestSuite()
+        self._suite = ConcurrentAsyncioTestSuite()
 
     def loadTestsFromTestCase(self, testCaseClass):
-        class MixedTestCaseClass(ParallelAsyncioTestCaseMixin, testCaseClass):
+        class MixedTestCaseClass(ConcurrentAsyncioTestCaseMixin, testCaseClass):
             pass
 
         return super().loadTestsFromTestCase(MixedTestCaseClass)
@@ -336,10 +336,10 @@ class ParallelAsyncioTestLoader(unittest.TestLoader):
 
 
 def main(**kwargs):
-    unittest.main(testLoader=ParallelAsyncioTestLoader(), **kwargs)
+    unittest.main(testLoader=ConcurrentAsyncioTestLoader(), **kwargs)
 
 
 if __name__ == '__main__':
     main(module=None)
 else:
-    unittest.defaulTestLoader = ParallelAsyncioTestLoader()
+    unittest.defaulTestLoader = ConcurrentAsyncioTestLoader()
