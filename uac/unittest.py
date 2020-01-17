@@ -1,3 +1,6 @@
+# Reuses some code from cpython library.
+# Copyright © 2001-2020 Python Software Foundation; All Rights Reserved
+
 from typing import List, Tuple, Iterable
 import asyncio
 import collections
@@ -11,61 +14,80 @@ import unittest
 import unittest.mock
 
 
-class ContextMockingWrapperPolicy(asyncio.AbstractEventLoopPolicy):  # FIXME not needed, patch directly in Suite.run
+_context_entered_mocks = contextvars.ContextVar('_entered_unittest_mocks')
+_context_active_mocks = contextvars.ContextVar('_active_unittest_mocks')
+_global_entered_mocks = []
 
-    def __new__(cls, wrapped=None):
-        wrapped = wrapped or asyncio.get_event_loop_policy()
-        if not isinstance(wrapped.new_event_loop, functools.partial):
-            wrapped.new_event_loop = functools.partial(_new_event_loop_with_patcher, wrapped.new_event_loop)
+_original_enter = unittest.mock._patch.__enter__
+_original_exit = unittest.mock._patch.__exit__
 
-        return wrapped
+# TODO patch.dict
 
-
-def _new_event_loop_with_patcher(original_new_event_loop):  # FIXME not needed, patch directly in Suite.run
-    print('_new_event_loop_with_patcher')
-    loop = original_new_event_loop()
-
-    assert not isinstance(loop.call_soon, functools.partial)
-    loop.call_soon = functools.partial(_call_soon_with_mocks, loop.call_soon)
-
-    return loop
+@functools.wraps(unittest.mock._patch.__enter__)
+def _first_patch_enter(self, loop):
+    # Adding mocks context managing overhead only if tests actually use mocks
+    loop.call_soon = functools.partial(loop.call_soon, _active_mocks_contextmanager)
+    unittest.mock._patch.__enter__ = _patch_enter
+    return _patch_enter(self)
 
 
-def _call_soon_with_mocks(original_call_soon, callback, *args, context=None):
-    if context is None:
-        context = contextvars.copy_context()
-    else:
-        context = context.copy()
-
-    context.run(_record_active_mocks)
-    return original_call_soon(_active_mocks_contextmanager, callback, *args, context=context)
+# Keeping track of global mocking state
+@functools.wraps(unittest.mock._patch.__enter__)
+def _patch_enter(self):
+    mock = _original_enter(self)
+    _global_entered_mocks.append((self, mock))
+    return mock
 
 
-active_mocks = contextvars.ContextVar('_active_unittest_mocks')
+@functools.wraps(unittest.mock._patch.__exit__)
+def _patch_exit(self, *args):
+    _original_exit(self, *args)
+    for i, (patcher, _) in enumerate(reversed(_global_entered_mocks)):
+        if patcher is self:
+            _global_entered_mocks.pop(len(_global_entered_mocks) - i - 1)
+            break
 
 
-def _record_active_mocks():
-    active_mocks.set(unittest.mock._patch._active_patches[:])
+def _record_mocks():
+    # Recording global mocking state into context
+    _context_active_mocks.set(unittest.mock._patch._active_patches[:])
+    _context_entered_mocks.set(_global_entered_mocks[:])
+
+
+def _swap_mocks_context(new_entered: List[tuple], new_active: list):
+    for patch, mock in _global_entered_mocks:
+        # Forcing patch to reuse the same mock on next activation (context switch)
+        patch.autospec = None
+        patch.kwargs = None
+        patch.new = mock
+        _original_exit(patch)
+
+    previous_entered = _global_entered_mocks[:]
+    previous_active = unittest.mock._patch._active_patches[:]
+
+    _global_entered_mocks[:] = new_entered
+    unittest.mock._patch._active_patches[:] = new_active
+
+    for patch, mock in _global_entered_mocks:
+        mock2 = _original_enter(patch)
+        # Sanity check
+        assert mock is mock2
+
+    return previous_entered, previous_active
 
 
 def _active_mocks_contextmanager(callback, *args):
-    current_mocks = unittest.mock._patch._active_patches[:]
-    unittest.mock.patch.stopall()
-    for p in active_mocks.get():
-        p.start()
-
-    print('switched mocks from', current_mocks, 'to', unittest.mock._patch._active_patches)
+    previous = _swap_mocks_context(_context_entered_mocks.get(()), _context_active_mocks.get(()))
 
     try:
         callback(*args)
     finally:
-        _record_active_mocks()
-        unittest.mock.patch.stopall()
-        for p in current_mocks:
-            p.start()
+        _record_mocks()
+        _swap_mocks_context(*previous)
 
 
 async def maybe_await(f, *args, **kwargs):
+    # Why this isn't in standard library?
     if f is None:
         return None
 
@@ -77,8 +99,6 @@ async def maybe_await(f, *args, **kwargs):
 
 
 # TODO addCleanup/doCleanups
-# TODO debug()
-
 
 class ParallelAsyncioTestCaseMixin(object):
     # copy-paste from TestCase/IsolatedAsyncioTestCase cpython 3.8.1
@@ -88,10 +108,13 @@ class ParallelAsyncioTestCaseMixin(object):
     async def asyncTearDown(self):
         pass
 
-    #def addAsyncCleanup(self, func, /, *args, **kwargs):
-    #    self.addCleanup(*(func, *args), **kwargs)
+    def addAsyncCleanup(self, func, /, *args, **kwargs):
+        self.addCleanup(*(func, *args), **kwargs)
 
     async def run(self, result=None):
+        # Mostly copy-paste from TestCase
+        # allowing for async setUp(), testMethod, tearDown(), cleanup functions
+
         orig_result = result
         if result is None:
             result = self.defaultTestResult()
@@ -135,9 +158,10 @@ class ParallelAsyncioTestCaseMixin(object):
                     await maybe_await(self.tearDown)
                     await maybe_await(self.asyncTearDown)
 
-            self.doCleanups()
+            await self._async_do_cleanups()
             for test, reason in outcome.skipped:
                 self._addSkip(result, test, reason)
+
             self._feedErrorsToResult(result, outcome.errors)
             if outcome.success:
                 if expecting_failure:
@@ -164,6 +188,12 @@ class ParallelAsyncioTestCaseMixin(object):
             # clear the outcome, no more needed
             self._outcome = None
 
+    async def _async_do_cleanups(self):
+        while self._cleanups:
+            function, args, kwargs = self._cleanups.pop()
+            with self._outcome.testPartExecutor(self):
+                await maybe_await(function, *args, **kwargs)
+
 
 class ParallelAsyncioTestSuite(unittest.BaseTestSuite):
 
@@ -180,7 +210,7 @@ class ParallelAsyncioTestSuite(unittest.BaseTestSuite):
         assert isinstance(tests[0], unittest.TestCase)
         assert all(t.__class__ is tests[0].__class__ for t in tests)
         # 0 - MixedTestCaseClass
-        # 1 - ParallelAsyncioTestSuite
+        # 1 - ParallelAsyncioTestCaseMixin
         # 2 - original testCaseClass
         original_class = inspect.getmro(tests[0].__class__)[2]
 
@@ -197,14 +227,27 @@ class ParallelAsyncioTestSuite(unittest.BaseTestSuite):
         current.classes[original_class.__name__].extend(tests)
 
     def run(self, result, debug=False):
-        asyncio.set_event_loop_policy(ContextMockingWrapperPolicy())
-        asyncio.new_event_loop().run_until_complete(self._run_module((), self._tree, result, debug))
+        self.loop = asyncio.new_event_loop()
+
+        unittest.mock._patch.__enter__ = functools.partialmethod(_first_patch_enter, self.loop)
+        unittest.mock._patch.__exit__ = _patch_exit
+        try:
+            self.loop.run_until_complete(self._run_module((), self._tree, result, debug))
+        finally:
+            unittest.mock._patch.__enter__ = _original_enter
+            unittest.mock._patch.__exit__ = _original_exit
 
     async def _run_module(self, module_name: Tuple[str], tests: TestModule, result, debug):
         async with self._module_fixture_contextmanager('.'.join(module_name), result, debug):
             await asyncio.gather(
-                *(self._run_class(c, result, debug) for c in tests.classes.values()),
-                *(self._run_module((*module_name, k), m, result, debug) for k, m in tests.submodules.items()),
+                *(
+                    asyncio.create_task(self._run_class(c, result, debug))
+                    for c in tests.classes.values()
+                ),
+                *(
+                    asyncio.create_task(self._run_module((*module_name, k), m, result, debug))
+                    for k, m in tests.submodules.items()
+                ),
             )
 
     async def _run_class(self, tests: List[unittest.TestCase], result, debug):
@@ -212,8 +255,14 @@ class ParallelAsyncioTestSuite(unittest.BaseTestSuite):
             return
 
         async with self._class_fixture_contextmanager(tests[0].__class__, result, debug):
-            await asyncio.gather(*(maybe_await(t, result) for t in tests))
+            await asyncio.gather(
+                *(
+                    asyncio.create_task(maybe_await(t, result))
+                    for t in tests
+                ),
+            )
 
+    # Partial copy-pastes from TestSuite
     @contextlib.asynccontextmanager
     async def _module_fixture_contextmanager(self, module_name, result, debug):
         setUpModule = None
@@ -267,10 +316,9 @@ class ParallelAsyncioTestSuite(unittest.BaseTestSuite):
                     raise
                 self._createClassOrModuleLevelException(result, e, 'tearDownClass', str(cls))
 
-    def __repr__(self):
-        return 'ParallelAsyncioTestSuite<>'
 
 class ParallelAsyncioTestLoader(unittest.TestLoader):
+    # Simple wrapper which reuses single suite and mixes in async run() for test cases
 
     def __init__(self):
         super().__init__()
@@ -283,15 +331,15 @@ class ParallelAsyncioTestLoader(unittest.TestLoader):
         return super().loadTestsFromTestCase(MixedTestCaseClass)
 
     def suiteClass(self, tests):
-        print('suiteClass', tests)
         self._suite.add_to_tree(testCase for testCase in tests if testCase is not self._suite)
         return self._suite
 
 
 def main(**kwargs):
-    unittest.main(testLoader=ParallelAsyncioTestLoader(), exit=False, **kwargs)
-    #import pprint; pprint.pprint(sys.modules)
+    unittest.main(testLoader=ParallelAsyncioTestLoader(), **kwargs)
 
 
 if __name__ == '__main__':
     main(module=None)
+else:
+    unittest.defaulTestLoader = ParallelAsyncioTestLoader()
